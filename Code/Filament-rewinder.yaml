@@ -1,0 +1,373 @@
+esphome:
+  name: filament-rewinder
+  friendly_name: Filament Rewinder
+
+  on_boot:
+    priority: -200
+    then:
+      - script.execute: motor_stop_disarm
+      - script.execute: splash_timer
+
+esp32:
+  board: seeed_xiao_esp32c6
+  framework:
+    type: esp-idf
+
+logger:
+  level: DEBUG
+
+api:
+  reboot_timeout: 0s
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  use_address: 192.168.188.92
+
+captive_portal:
+
+web_server:
+  port: 80
+
+# --------------------- WiFi info (for splash) ---------------------
+text_sensor:
+  - platform: wifi_info
+    ip_address:
+      name: "Rewinder IP"
+      id: rewinder_ip
+      internal: true
+
+# --------------------- SPI for Waveshare SSD1351 ---------------------
+spi:
+  clk_pin: GPIO20
+  mosi_pin: GPIO19
+
+font:
+  - file: "gfonts://Roboto Mono"
+    id: f12
+    size: 12
+  - file: "gfonts://Roboto Mono"
+    id: f18
+    size: 18
+
+globals:
+  - id: motor_running
+    type: bool
+    restore_value: no
+    initial_value: "false"
+
+  # Most recent commanded speed (HA slider OR pot)
+  - id: speed_target
+    type: float
+    restore_value: yes
+    initial_value: "30.0"
+
+  # POT arming: MUST hit zero before pot can start motor
+  - id: pot_armed
+    type: bool
+    restore_value: no
+    initial_value: "false"
+
+  - id: pot_last_pct
+    type: float
+    restore_value: no
+    initial_value: "0.0"
+
+  # Splash screen state
+  - id: show_splash
+    type: bool
+    restore_value: no
+    initial_value: "true"
+
+script:
+  - id: splash_timer
+    mode: restart
+    then:
+      - lambda: 'id(show_splash) = true;'
+      - delay: 2s
+      - lambda: 'id(show_splash) = false;'
+
+  - id: motor_apply_speed
+    mode: restart
+    then:
+      - lambda: |-
+          float s = id(speed_target);
+          if (s < 0) s = 0;
+          if (s > 100) s = 100;
+          float duty = s / 100.0f;
+          ESP_LOGI("rewinder", "APPLY speed_target=%.1f%% duty=%.3f", s, duty);
+          id(rewinder_pwm).set_level(duty);
+
+  - id: motor_start_checked
+    mode: restart
+    then:
+      - logger.log:
+          format: "START req | Filament=%s | SpoolFull=%s | SpeedTarget=%.1f"
+          args:
+            - 'id(filament_sensor).state ? "ON" : "OFF"'
+            - 'id(spool_full).state ? "ON" : "OFF"'
+            - 'id(speed_target)'
+      - if:
+          condition:
+            and:
+              - binary_sensor.is_on: filament_sensor
+              - binary_sensor.is_off: spool_full
+          then:
+            - lambda: 'id(motor_running) = true;'
+            - switch.template.publish:
+                id: rewinder_motor
+                state: ON
+            - script.execute: motor_apply_speed
+          else:
+            - logger.log: "BLOCKED: need Filament=ON and SpoolFull=OFF"
+            - script.execute: motor_stop_disarm
+
+  # Stop + DISARM pot (must return to 0 to start again)
+  - id: motor_stop_disarm
+    mode: restart
+    then:
+      - output.set_level:
+          id: rewinder_pwm
+          level: 0%
+      - lambda: |-
+          id(motor_running) = false;
+          id(pot_armed) = false;
+      - switch.template.publish:
+          id: rewinder_motor
+          state: OFF
+      - logger.log: "MOTOR STOP (disarm)"
+
+  # Stop + ARM pot (used when pot is at 0)
+  - id: motor_stop_arm
+    mode: restart
+    then:
+      - output.set_level:
+          id: rewinder_pwm
+          level: 0%
+      - lambda: |-
+          id(motor_running) = false;
+          id(pot_armed) = true;
+      - switch.template.publish:
+          id: rewinder_motor
+          state: OFF
+      - logger.log: "MOTOR STOP (armed at 0)"
+
+# --------------------- Motor PWM ---------------------
+output:
+  - platform: ledc
+    id: rewinder_pwm
+    pin: GPIO18
+    frequency: 20000 Hz
+    zero_means_zero: true
+
+# --------------------- HA Speed Slider (never starts motor) ---------------------
+number:
+  - platform: template
+    id: rewinder_speed
+    name: "Rewinder Speed"
+    min_value: 0
+    max_value: 100
+    step: 1
+    optimistic: true
+    restore_value: true
+    initial_value: 30
+    set_action:
+      - lambda: |-
+          id(speed_target) = x;
+          ESP_LOGI("rewinder", "SET speed_target=%.1f%% (from HA)", x);
+
+      - if:
+          condition:
+            lambda: 'return id(motor_running);'
+          then:
+            - if:
+                condition:
+                  and:
+                    - binary_sensor.is_on: filament_sensor
+                    - binary_sensor.is_off: spool_full
+                then:
+                  - script.execute: motor_apply_speed
+                else:
+                  - logger.log: "STOP: speed change while sensors not OK"
+                  - script.execute: motor_stop_disarm
+          else:
+            - output.set_level:
+                id: rewinder_pwm
+                level: 0%
+
+# --------------------- Local POT control ---------------------
+# MUST hit 0% to ARM, then start only on rising edge from 0 -> >0
+sensor:
+  - platform: adc
+    id: rewinder_speed_pot
+    name: "Rewinder Speed Pot"
+    internal: true
+    pin: GPIO1
+    attenuation: 11db
+    update_interval: 80ms
+    filters:
+      - sliding_window_moving_average:
+          window_size: 5
+          send_every: 1
+      - lambda: |-
+          // x is VOLTS (0.0 .. ~3.3V)
+          if (x < 0.03f) return 0.0f;
+          if (x > 3.27f) return 3.3f;
+          return x;
+    on_value:
+      then:
+        - lambda: |-
+            float v = x;
+            float pct = (v / 3.3f) * 100.0f;
+
+            if (fabsf(pct - id(pot_last_pct)) < 0.7f) return;
+
+            // 0% region -> STOP and ARM
+            if (pct <= 1.0f) {
+              id(speed_target) = 0.0f;
+              id(pot_last_pct) = pct;
+              ESP_LOGI("rewinder", "POT=0 -> ARM");
+              id(motor_stop_arm).execute();
+              return;
+            }
+
+            bool rising_from_zero = (id(pot_last_pct) <= 1.0f);
+            id(pot_last_pct) = pct;
+            id(speed_target) = pct;
+
+            // Safety interlock always enforced
+            if (!id(filament_sensor).state || id(spool_full).state) {
+              ESP_LOGW("rewinder", "POT blocked by safety (Filament=%d SpoolFull=%d)",
+                       id(filament_sensor).state, id(spool_full).state);
+              id(motor_stop_disarm).execute();
+              return;
+            }
+
+            // Motor running -> just apply speed
+            if (id(motor_running)) {
+              id(motor_apply_speed).execute();
+              return;
+            }
+
+            // Motor OFF -> start only if ARMED and rising from 0
+            if (id(pot_armed) && rising_from_zero) {
+              ESP_LOGI("rewinder", "POT start at %.1f%%", pct);
+              id(motor_start_checked).execute();
+            }
+
+# --------------------- Sensors ---------------------
+binary_sensor:
+  - platform: status
+    name: "Rewinder Online"
+
+  # OptoTap (active-low -> inverted: true)
+  - platform: gpio
+    id: filament_sensor
+    name: "Filament Sensor"
+    pin:
+      number: GPIO16
+      mode: INPUT_PULLUP
+      inverted: true
+    filters:
+      - delayed_on: 30ms
+    on_release:
+      then:
+        - logger.log: "STOP: Filament OFF"
+        - script.execute: motor_stop_disarm
+
+  # Spool full (NC wiring, triggers when it OPENS -> pressed event)
+  - platform: gpio
+    id: spool_full
+    name: "Spool Full"
+    pin:
+      number: GPIO17
+      mode: INPUT_PULLUP
+      inverted: false
+    filters:
+      - delayed_on: 30ms
+    on_press:
+      then:
+        - logger.log: "STOP: Spool Full ON"
+        - script.execute: motor_stop_disarm
+
+# --------------------- HA Motor Switch ---------------------
+switch:
+  - platform: template
+    id: rewinder_motor
+    name: "Rewinder Motor"
+    optimistic: false
+    restore_mode: ALWAYS_OFF
+    lambda: |-
+      return id(motor_running);
+
+    turn_on_action:
+      - script.execute: motor_start_checked
+
+    turn_off_action:
+      - script.execute: motor_stop_disarm
+
+# --------------------- SSD1351 RGB OLED Display ---------------------
+display:
+  - platform: ssd1351_spi
+    id: rgb_oled
+    model: "SSD1351 128x128"
+    cs_pin: GPIO21
+    dc_pin: GPIO22
+    reset_pin: GPIO23
+    update_interval: 250ms
+    lambda: |-
+      const auto YELLOW = Color(255, 255, 0);
+      const auto BLUE   = Color(0, 140, 255);
+      const auto RED    = Color(255, 0, 0);
+      const auto WHITE  = Color(255, 255, 255);
+      const auto GREY   = Color(120, 120, 120);
+      const auto BLACK  = Color(0, 0, 0);
+
+      it.fill(BLACK);
+
+      if (id(show_splash)) {
+        it.printf(8, 18, id(f18), YELLOW, "FILAMENT");
+        it.printf(8, 42, id(f18), YELLOW, "REWINDER");
+        it.printf(8, 76, id(f12), WHITE, "IP:");
+        it.printf(30, 76, id(f12), BLUE, "%s", id(rewinder_ip).state.c_str());
+        it.printf(8, 96, id(f12), GREY, "Ready...");
+        return;
+      }
+
+      // Title
+      it.printf(0, 0, id(f12), YELLOW, "FILAMENT REWINDER");
+
+      // Motor line (blue)
+      it.printf(0, 24, id(f12), BLUE, "Motor:");
+      if (id(motor_running)) {
+        it.printf(54, 24, id(f12), BLUE, "ON  %3.0f%%", id(speed_target));
+      } else {
+        it.printf(54, 24, id(f12), GREY, "OFF %3.0f%%", id(speed_target));
+      }
+
+      // Filament line (blue if loaded, red if none)
+      it.printf(0, 52, id(f12), BLUE, "Filament:");
+      it.printf(72, 52, id(f12),
+        id(filament_sensor).state ? BLUE : RED,
+        id(filament_sensor).state ? "LOADED" : "EMPTY");
+
+      // Spool line (blue if OK, red if FULL)
+      it.printf(0, 80, id(f12), BLUE, "Spool:");
+      it.printf(54, 80, id(f12),
+        id(spool_full).state ? RED : BLUE,
+        id(spool_full).state ? "FULL!" : "OK");
+
+      // Bottom hint / state
+      if (!id(filament_sensor).state) {
+        it.printf(0, 108, id(f12), RED, "NO FILAMENT - STOP");
+      } else if (id(spool_full).state) {
+        it.printf(0, 108, id(f12), RED, "SPOOL FULL - STOP");
+      } else if (!id(pot_armed) && !id(motor_running)) {
+        it.printf(0, 108, id(f12), RED, "Turn to MIN to ARM");
+      } else if (id(pot_armed) && !id(motor_running)) {
+        it.printf(0, 108, id(f12), GREY, "ARMED and Ready!");
+      }
