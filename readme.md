@@ -1,9 +1,10 @@
-## Firmware
+## Firmware / Code
 
-The ESP32 code is in the [`code/`](./code) folder.
+The ESP32 firmware lives in the [`Code`](https://github.com/elcrni/Speed-Respooler-V2/tree/main/Code) folder.
 
-This repository includes two firmware options for **[PROJECT / DEVICE NAME HERE]**:
-- **ESPHome (YAML)** — for Home Assistant / ESPHome users who want simple configuration and OTA updates.
-- **Arduino (`.ino`)** — for users who prefer a classic Arduino workflow or want to modify the firmware directly.
+You can use the project in two ways:
 
-Both versions target the same hardware and features — pick whichever fits your setup.
+- **ESPHome (YAML)** — for users who want easy setup, OTA updates, and Home Assistant integration.
+- **Arduino sketch (`.ino`)** — a standalone firmware option if you prefer the classic Arduino workflow (flash via Arduino IDE / PlatformIO).
+
+Pick the version that matches your setup and workflow.
